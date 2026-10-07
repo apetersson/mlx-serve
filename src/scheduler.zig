@@ -3327,8 +3327,8 @@ fn mlxActiveBytes() u64 {
 /// The n-gram table is resident, wired, only on the `--ple-gpu` arm, and sits outside the
 /// `.safetensors` sum; the host gather only faults in the rows it reads.
 fn pleTableBill(io: std.Io, config: *const model_mod.ModelConfig) u64 {
-    if (!ple_gpu.enabled) return 0;
-    if (config.embedded_ple_payload_bytes) |bytes| return bytes;
+    if (!ple_gpu.enabled or @import("qwen4_exp.zig").disk_only_enabled) return 0;
+    if (config.usesEmbeddedNgramTable()) return config.embedded_ple_payload_bytes.?;
     const p = config.ngram_table_path orelse return 0;
     const st = std.Io.Dir.cwd().statFile(io, p, .{}) catch return 0;
     return @intCast(st.size);
@@ -3380,6 +3380,14 @@ test "pleTableBill: the GPU arm bills the n-gram table, embedded shards included
     // An embedded pack bills its shards' payload; its `ngram_table.bin` path names no file.
     config.embedded_ple_payload_bytes = 120;
     try std.testing.expectEqual(@as(u64, 120), pleTableBill(io, &config));
+    config.ngram_table_external = true;
+    try std.testing.expectEqual(@as(u64, 10), pleTableBill(io, &config));
+    const qwen4 = @import("qwen4_exp.zig");
+    const disk_was = qwen4.disk_only_enabled;
+    defer qwen4.disk_only_enabled = disk_was;
+    qwen4.disk_only_enabled = true;
+    try std.testing.expectEqual(@as(u64, 0), pleTableBill(io, &config));
+    qwen4.disk_only_enabled = disk_was;
     config = .{ .model_type = "qwen4_exp" };
     try std.testing.expectEqual(@as(u64, 0), pleTableBill(io, &config));
 }

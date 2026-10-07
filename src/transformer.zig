@@ -17502,16 +17502,16 @@ pub const Transformer = struct {
             errdefer allocator.destroy(st);
             st.* = .{
                 .hash = try qwen4_mod.NgramHash.init(config.vocab_size, config.ngram_size, config.heads_per_ngram, config.ngram_vocab_base, config.ngram_vocab_divisor, config.ngram_seed, 0, eos),
-                .table = if (config.embedded_ple_payload_bytes != null)
+                .table = if (config.usesEmbeddedNgramTable())
                     try qwen4_mod.NgramTable.openEmbedded(std.fs.path.dirname(config.ngram_table_path orelse return error.MissingNgramTable) orelse return error.MissingNgramTable, try model_mod.qwen4EmbeddedSpec(&config))
                 else
                     try qwen4_mod.NgramTable.open(config.ngram_table_path orelse return error.MissingNgramTable),
             };
             errdefer st.deinit();
-            if (config.embedded_ple_payload_bytes) |bytes| {
-                if (st.table.embeddedPayloadBytes() != bytes) return error.EmbeddedNgramTableChanged;
+            if (config.usesEmbeddedNgramTable()) {
+                if (st.table.embeddedPayloadBytes() != config.embedded_ple_payload_bytes.?) return error.EmbeddedNgramTableChanged;
             }
-            if (st.table.rows != st.hash.total_rows or st.table.dim * st.hash.n_heads != config.ple_embed_dim) {
+            if (st.table.rows != st.hash.total_rows or @as(u64, st.table.dim) * st.hash.n_heads != config.ple_embed_dim) {
                 log.err("[qwen4] ngram_table.bin geometry {d}x{d} does not match the config ({d} rows, {d} heads x dim)\n", .{ st.table.rows, st.table.dim, st.hash.total_rows, st.hash.n_heads });
                 return error.NgramTableMismatch;
             }
@@ -17524,7 +17524,7 @@ pub const Transformer = struct {
             if (st.gpu == null or st.table.embedded == null) st.table.startWarm();
             qwen4_state = st;
             qwen4_mtp = try loadQwen4Mtp(allocator, config, weights, &name_buf, s);
-            log.info("[qwen4] n-gram table {d} rows x {d} ({d}-bit, mmapped), PLE at layer {d}, QSA budget {d}/{d}\n", .{ st.table.rows, st.table.dim, st.table.bits, config.ple_layer_idx, config.indexer_budget, config.indexer_compress_ratio });
+            log.info("[qwen4] n-gram table {d} rows x {d} ({d}-bit, {s}), PLE at layer {d}, QSA budget {d}/{d}\n", .{ st.table.rows, st.table.dim, st.table.bits, st.table.readMode(), config.ple_layer_idx, config.indexer_budget, config.indexer_compress_ratio });
         }
 
         const int8_on = config.int8_prefill_override orelse qmm_int8.enabled();
@@ -23134,7 +23134,7 @@ pub const Transformer = struct {
         var gclk: ProfClock = if (diagEnvOnCached(&qwen4_profile_fwd_env, "QWEN4_PROFILE_FWD")) ProfClock.init() else undefined;
         // The pool's arm is a kv-length question; `ctx.moe_seq_offset` is the pre-chunk
         // position (`cache.step` is 0 forever on a GDN trunk).
-        st.table.gather(rows, host, @intCast(ctx.moe_seq_offset.*));
+        try st.table.gather(rows, host, @intCast(ctx.moe_seq_offset.*));
         if (diagEnvOnCached(&qwen4_profile_fwd_env, "QWEN4_PROFILE_FWD")) log.info("[qwen4-prof] ple gather S={d}: {d:.2} ms\n", .{ seq_len, @as(f64, @floatFromInt(gclk.lap())) / 1e6 });
         std.debug.assert(pk.len == host.len);
         for (host, pk) |v, *o| o.* = qwen4_mod.bf16Rne(v);
@@ -36864,7 +36864,7 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
             \\  float l = float(logits[rbase + e]);
             \\  float sy = 1.0f / (1.0f + metal::precise::exp(metal::abs(l)));
             \\  float sg = (l < 0.0f) ? sy : (1.0f - sy);
-            ++ "\n  // kolibri1 selects on the raw logit + bias; the others on sigmoid + bias.\n  rk[e] = " ++ (if (logit_sel) "l" else "sg") ++ " + float(bias[e]);\n  rw[e] = sg;"
+        ++ "\n  // kolibri1 selects on the raw logit + bias; the others on sigmoid + bias.\n  rk[e] = " ++ (if (logit_sel) "l" else "sg") ++ " + float(bias[e]);\n  rw[e] = sg;"
         else
             \\  rk[e] = float(logits[rbase + e]);
         ,
@@ -64196,8 +64196,8 @@ test "gdn_decode: recurSeqFold and recurSeq decline inputs whose width the kerne
     const g = gdn_decode.Geometry{ .hk = hk, .hv = hv, .dk = 128, .dv = 128 };
     var arrs: [14]mlx.mlx_array = undefined;
     const shapes = [_][]const c_int{
-        &.{ 1, t_len, c_dim }, &.{ 1, t_len, hv * 128 }, &.{ 1, t_len, hv }, &.{ 1, t_len, hv }, &.{ 1, 3, c_dim }, &.{ 1, hv, 128, 128 },
-        &.{ c_dim, 4, 1 },     &.{hv},                   &.{hv},              &.{128},             &.{ 1, t_len, hv * 128 + 1 }, &.{ 1, t_len, hv + 1 },
+        &.{ 1, t_len, c_dim },     &.{ 1, t_len, hv * 128 }, &.{ 1, t_len, hv }, &.{ 1, t_len, hv }, &.{ 1, 3, c_dim },            &.{ 1, hv, 128, 128 },
+        &.{ c_dim, 4, 1 },         &.{hv},                   &.{hv},             &.{128},            &.{ 1, t_len, hv * 128 + 1 }, &.{ 1, t_len, hv + 1 },
         &.{ 1, t_len + 1, c_dim }, &.{ 1, 3, c_dim + 1 },
     };
     for (&arrs, shapes) |*a, sh| a.* = try gdnParityRand(rnd, sh, 1.0, dt, s);
@@ -73274,12 +73274,12 @@ fn glmProfNow() i128 {
 fn glmProfLap(a: mlx.mlx_array, kind: GlmProfKind, t0: i128) i128 {
     _ = mlx.mlx_array_eval(a);
     const now = glmProfNow();
-    glm_prof_ns[@intFromEnum(kind)] += @intCast(now - t0);
+    glm_prof_ns[@backingInt(kind)] += @intCast(now - t0);
     return now;
 }
 
 fn glmProfMs(kind: GlmProfKind) f64 {
-    return @as(f64, @floatFromInt(glm_prof_ns[@intFromEnum(kind)])) / 1.0e6;
+    return @as(f64, @floatFromInt(glm_prof_ns[@backingInt(kind)])) / 1.0e6;
 }
 
 /// MiMo's attention reads its LOSSY decode-attn-quant copies at decode width and on a

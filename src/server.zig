@@ -294,6 +294,16 @@ pub const StreamHeartbeat = struct {
     }
 };
 
+/// Frame each non-empty write as one HTTP chunk, independently of socket-buffer boundaries.
+fn writeHttpChunk(w: *std.Io.Writer, data: []const u8) !void {
+    if (data.len == 0) return;
+    var hdr: [24]u8 = undefined;
+    const head = try std.fmt.bufPrint(&hdr, "{x}\r\n", .{data.len});
+    try w.writeAll(head);
+    try w.writeAll(data);
+    try w.writeAll("\r\n");
+}
+
 /// Connection wrapper bundling a TCP stream with its `Io` and per-connection
 /// reader/writer buffers. Replaces `std.net.Stream` in 0.16 — methods that took
 /// a bare stream now take `*Conn` so the IO interface and buffers travel together.
@@ -318,6 +328,9 @@ pub const Conn = struct {
     /// True once this connection has written a `text/event-stream` head: past it a generation
     /// failure can only be an SSE `error` event. Set only in `sendSseHeaders`.
     sse_headers_sent: bool = false,
+    /// HTTP body writes are chunk-framed only after our SSE head is flushed.
+    /// WebSocket bridges and Ollama sinks retain their own framing.
+    chunked_body: bool = false,
     /// True once this connection has written a response head with a `Content-Length`: the body
     /// ends by its length, not at the close, so `close` need not wait for the peer.
     length_framed: bool = false,
@@ -339,6 +352,7 @@ pub const Conn = struct {
         c.ws_mode = null;
         c.ollama_sink = null;
         c.sse_headers_sent = false;
+        c.chunked_body = false;
         c.length_framed = false;
         c.heartbeat = .{ .last_write_ms = nowMsMonotonic(io) };
     }
@@ -365,13 +379,18 @@ pub const Conn = struct {
     pub fn writeAll(c: *Conn, data: []const u8) !void {
         c.heartbeat.noteWrite(nowMsMonotonic(c.io));
         if (c.ollama_sink) |s| return s.feed(data);
-        try c.writer().writeAll(data);
+        if (c.chunked_body) {
+            try writeHttpChunk(c.writer(), data);
+        } else {
+            try c.writer().writeAll(data);
+        }
         try c.writer().flush();
     }
 
     pub fn writeAllNoFlush(c: *Conn, data: []const u8) !void {
         c.heartbeat.noteWrite(nowMsMonotonic(c.io));
         if (c.ollama_sink) |s| return s.feed(data);
+        if (c.chunked_body) return writeHttpChunk(c.writer(), data);
         try c.writer().writeAll(data);
     }
 
@@ -401,6 +420,7 @@ pub const Conn = struct {
     /// on macOS), so the reader gets the whole body and then ECONNRESET, not EOF. A length-framed
     /// response closes at once: its reader knows where the body ends.
     pub fn close(c: *Conn) void {
+        c.endChunkedBody();
         c.flush() catch {};
         if (c.length_framed) return c.stream.close(c.io);
         const fd = c.stream.socket.handle;
@@ -415,6 +435,15 @@ pub const Conn = struct {
             if (std.c.recv(fd, &sink, sink.len, std.posix.MSG.DONTWAIT) <= 0) break;
         }
         c.stream.close(c.io);
+    }
+
+    /// Emit the terminal chunk once, bypassing payload framing; close still retains the socket
+    /// for clients that read through TCP EOF instead of stopping at the HTTP body boundary.
+    pub fn endChunkedBody(c: *Conn) void {
+        if (!c.chunked_body) return;
+        c.chunked_body = false;
+        c.writer().writeAll("0\r\n\r\n") catch return;
+        c.writer().flush() catch {};
     }
 
     /// Non-blocking probe: has the peer closed the connection? TCP send
@@ -12181,15 +12210,18 @@ const SSE_ALLOW_HEADERS_ANTHROPIC = "Content-Type, Authorization, x-api-key, ant
 /// The one place a `text/event-stream` response head is written. Past this call a generation
 /// failure is an SSE `error` event; before it the stream answers like its non-streaming twin.
 fn sendSseHeaders(stream: *Conn, kind: []const u8, allow_headers: []const u8) !void {
+    const chunked = stream.ws_mode == null and stream.ollama_sink == null;
     try stream.writeAllNoFlush("HTTP/1.1 200 OK\r\n" ++
         "Content-Type: text/event-stream\r\n" ++
-        "Cache-Control: no-cache\r\n" ++
-        "Connection: close\r\n" ++
+        "Cache-Control: no-cache\r\n");
+    if (chunked) try stream.writeAllNoFlush("Transfer-Encoding: chunked\r\n");
+    try stream.writeAllNoFlush("Connection: close\r\n" ++
         "Access-Control-Allow-Origin: *\r\n" ++
         "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
         "Access-Control-Allow-Headers: ");
     try stream.writeAllNoFlush(allow_headers);
     try stream.writeAll("\r\n\r\n");
+    stream.chunked_body = chunked;
     stream.sse_headers_sent = true;
     logHttpStreamStart(kind);
 }
@@ -19372,6 +19404,154 @@ fn storeResponse(
 
 const testing = std.testing;
 
+fn httpTestSocketPair() ![2]std.posix.fd_t {
+    var sv: [2]std.posix.fd_t = undefined;
+    try testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    errdefer for (sv) |fd| {
+        _ = std.c.close(fd);
+    };
+    const timeout: std.posix.timeval = .{ .sec = 5, .usec = 0 };
+    for (sv) |fd| {
+        try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, &std.mem.toBytes(@as(c_int, 128 * 1024)));
+        try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, &std.mem.toBytes(timeout));
+        try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &std.mem.toBytes(timeout));
+    }
+    return sv;
+}
+
+fn httpTestCloseAndRead(conn: *Conn, peer: std.posix.fd_t, buf: []u8) ![]const u8 {
+    _ = std.posix.system.shutdown(peer, std.posix.SHUT.WR);
+    conn.close();
+    var got: usize = 0;
+    while (got < buf.len) {
+        const n = std.c.recv(peer, &buf[got], buf.len - got, 0);
+        try testing.expect(n >= 0);
+        if (n == 0) return buf[0..got];
+        got += @intCast(n);
+    }
+    return error.Overflow;
+}
+
+test "chunked SSE headers remain raw while flushed and buffered body writes are framed" {
+    const sv = try httpTestSocketPair();
+    defer _ = std.c.close(sv[1]);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, testing.io);
+    try sendSseHeaders(&conn, "test", SSE_ALLOW_HEADERS_ANTHROPIC);
+    try conn.writeAllNoFlush("abc");
+    try conn.writeAllNoFlush("");
+    try conn.writeAll("de");
+    try conn.writeAll("");
+    conn.endChunkedBody();
+    conn.endChunkedBody();
+    var buf: [1024]u8 = undefined;
+    const response = try httpTestCloseAndRead(&conn, sv[1], &buf);
+    try testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK\r\n"));
+    const head_end = std.mem.indexOf(u8, response, "\r\n\r\n").? + 4;
+    try testing.expect(std.mem.indexOf(u8, response[0..head_end], "Transfer-Encoding: chunked\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, response[0..head_end], "x-api-key, anthropic-version\r\n") != null);
+    try testing.expectEqualStrings("3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n", response[head_end..]);
+}
+
+test "chunked SSE close emits a terminal chunk even with no body events" {
+    const sv = try httpTestSocketPair();
+    defer _ = std.c.close(sv[1]);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, testing.io);
+    try sendSseHeaders(&conn, "test", SSE_ALLOW_HEADERS_DEFAULT);
+    var buf: [1024]u8 = undefined;
+    const response = try httpTestCloseAndRead(&conn, sv[1], &buf);
+    const head_end = std.mem.indexOf(u8, response, "\r\n\r\n").? + 4;
+    try testing.expectEqualStrings("0\r\n\r\n", response[head_end..]);
+}
+
+test "chunked SSE payload larger than the writer buffer stays one complete chunk" {
+    const sv = try httpTestSocketPair();
+    defer _ = std.c.close(sv[1]);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, testing.io);
+    try sendSseHeaders(&conn, "test", SSE_ALLOW_HEADERS_DEFAULT);
+    var payload: [16 * 1024 + 1]u8 = undefined;
+    @memset(&payload, 'x');
+    try conn.writeAllNoFlush(&payload);
+    var buf: [32 * 1024]u8 = undefined;
+    const response = try httpTestCloseAndRead(&conn, sv[1], &buf);
+    const head_end = std.mem.indexOf(u8, response, "\r\n\r\n").? + 4;
+    const body = response[head_end..];
+    try testing.expect(std.mem.startsWith(u8, body, "4001\r\n"));
+    try testing.expectEqualStrings(&payload, body[6 .. 6 + payload.len]);
+    try testing.expectEqualStrings("\r\n0\r\n\r\n", body[6 + payload.len ..]);
+}
+
+test "chunked framing leaves raw NDJSON replies unchanged" {
+    const sv = try httpTestSocketPair();
+    defer _ = std.c.close(sv[1]);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, testing.io);
+    const head = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n";
+    try conn.writeAll(head);
+    try conn.writeAll("{\"done\":true}\n");
+    var buf: [1024]u8 = undefined;
+    const response = try httpTestCloseAndRead(&conn, sv[1], &buf);
+    try testing.expectEqualStrings(head ++ "{\"done\":true}\n", response);
+}
+
+test "chunked framing bypasses the Ollama SSE sink and its NDJSON output" {
+    const sv = try httpTestSocketPair();
+    defer _ = std.c.close(sv[1]);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, testing.io);
+    var sink = ollama_mod.Sink.init(testing.allocator, .{
+        .mode = .chat,
+        .wants_stream = true,
+        .model = "test",
+        .out_impl = &conn,
+        .outFn = ollamaSinkOut,
+        .nowMsFn = ollamaSinkNowMs,
+    });
+    defer sink.deinit();
+    conn.ollama_sink = &sink;
+    try sendSseHeaders(&conn, "test", SSE_ALLOW_HEADERS_DEFAULT);
+    try conn.writeAllNoFlush("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n");
+    try conn.writeAll("data: [DONE]\n\n");
+    conn.ollama_sink = null;
+    try sink.finish();
+    var buf: [4096]u8 = undefined;
+    const response = try httpTestCloseAndRead(&conn, sv[1], &buf);
+    const head_end = std.mem.indexOf(u8, response, "\r\n\r\n").? + 4;
+    try testing.expect(std.mem.indexOf(u8, response[0..head_end], "Transfer-Encoding:") == null);
+    var lines = std.mem.tokenizeScalar(u8, response[head_end..], '\n');
+    const first = try std.json.parseFromSlice(std.json.Value, testing.allocator, lines.next().?, .{});
+    defer first.deinit();
+    try testing.expectEqualStrings("hello", first.value.object.get("message").?.object.get("content").?.string);
+    const last = try std.json.parseFromSlice(std.json.Value, testing.allocator, lines.next().?, .{});
+    defer last.deinit();
+    try testing.expect(last.value.object.get("done").?.bool);
+    try testing.expect(lines.next() == null);
+}
+
+test "chunked framing bypasses WebSocket events and keepalives" {
+    const sv = try httpTestSocketPair();
+    defer _ = std.c.close(sv[1]);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, testing.io);
+    var ws: WsConnT = .{ .conn = &conn };
+    var bridge: WsBridge = .{ .impl = &ws, .sendTextFn = wsBridgeSend };
+    conn.ws_mode = &bridge;
+    try sendSseHeaders(&conn, "test", SSE_ALLOW_HEADERS_DEFAULT);
+    const payload = "{\"type\":\"response.completed\"}";
+    try sendAnthropicEvent(&conn, "response.completed", payload);
+    try sendStreamKeepalive(&conn);
+    var buf: [1024]u8 = undefined;
+    const response = try httpTestCloseAndRead(&conn, sv[1], &buf);
+    const head_end = std.mem.indexOf(u8, response, "\r\n\r\n").? + 4;
+    try testing.expect(std.mem.indexOf(u8, response[0..head_end], "Transfer-Encoding:") == null);
+    const frame = response[head_end..];
+    try testing.expectEqual(@as(u8, 0x81), frame[0]);
+    try testing.expectEqual(@as(u8, payload.len), frame[1]);
+    try testing.expectEqualStrings(payload, frame[2..]);
+}
+
 test "Conn.peerClosed: alive socket returns false, closed peer returns true" {
     // Create a connected socket pair (AF_UNIX SOCK_STREAM via socketpair).
     var sv: [2]std.posix.fd_t = undefined;
@@ -19402,9 +19582,9 @@ test "Conn.peerClosed: alive socket returns false, closed peer returns true" {
     try testing.expect(closed);
 }
 
-/// Runs `Conn.close` after one response, with a peer that stays connected, and checks whether it
-/// held the socket (`close_delimited`) or returned at once.
-fn expectCloseWaitsForPeer(close_delimited: bool) !void {
+/// Checks whether `close` retains the socket for EOF readers or returns at once for a known length.
+fn expectCloseWaitsForPeer(framing: enum { close_delimited, length, chunked }) !void {
+    const close_delimited = framing != .length;
     var sv: [2]std.posix.fd_t = undefined;
     const AF_UNIX: c_uint = 1;
     const SOCK_STREAM: c_uint = 1;
@@ -19414,7 +19594,11 @@ fn expectCloseWaitsForPeer(close_delimited: bool) !void {
     Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, testing.io);
     const tail: []const u8 = if (close_delimited) "data: [DONE]\n\n" else "{}";
     if (close_delimited) {
-        try sendSseHeaders(&conn, "test", SSE_ALLOW_HEADERS_DEFAULT);
+        if (framing == .chunked) {
+            try sendSseHeaders(&conn, "test", SSE_ALLOW_HEADERS_DEFAULT);
+        } else {
+            try conn.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
+        }
         try conn.writeAll(tail);
     } else {
         try sendResponseFramed(&conn, "200 OK", "application/json", tail);
@@ -19441,10 +19625,10 @@ fn expectCloseWaitsForPeer(close_delimited: bool) !void {
         if (n <= 0) break;
         got += @intCast(n);
     }
-    try testing.expect(std.mem.endsWith(u8, buf[0..got], tail));
+    const expected_tail = if (framing == .chunked) "data: [DONE]\n\n\r\n0\r\n\r\n" else tail;
+    try testing.expect(std.mem.endsWith(u8, buf[0..got], expected_tail));
 
-    // ... and only a close-delimited body keeps the server's end open, so the kernel cannot
-    // reset a lagging reader.
+    // EOF readers keep the server's end open, so the kernel cannot reset a lagging reader.
     var waited: u32 = 0;
     while (!closed.load(.acquire) and waited < 50) : (waited += 1) {
         std.Io.sleep(testing.io, .fromMilliseconds(10), .real) catch {};
@@ -19461,11 +19645,15 @@ fn expectCloseWaitsForPeer(close_delimited: bool) !void {
 }
 
 test "Conn.close keeps the socket until the peer hangs up, after a close-delimited body" {
-    try expectCloseWaitsForPeer(true);
+    try expectCloseWaitsForPeer(.close_delimited);
 }
 
 test "Conn.close does not wait for the peer after a Content-Length response" {
-    try expectCloseWaitsForPeer(false);
+    try expectCloseWaitsForPeer(.length);
+}
+
+test "chunked Conn.close emits the terminal chunk but retains the socket until the peer hangs up" {
+    try expectCloseWaitsForPeer(.chunked);
 }
 
 test "listenExclusive: a second server cannot bind a port that is already listening" {

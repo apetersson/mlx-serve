@@ -311,6 +311,10 @@ pub const ModelConfig = struct {
     ngram_seed: u64 = 1234,
     split_ngram_parts: u32 = 128,
     embedded_ple_payload_bytes: ?u64 = null,
+    /// Source selection is independent of embedded CHECKPOINT payload metadata.
+    ngram_table_external: bool = false,
+    ngram_cache_namespace: [48]u8 = @splat(0),
+    ngram_cache_namespace_len: u8 = 0,
     qwen4_norm_convention: ?Qwen4NormConvention = null,
     indexer_n_heads: u32 = 0, // 0 = dense attention
     indexer_head_dim: u32 = 0,
@@ -998,6 +1002,7 @@ pub const ModelConfig = struct {
     /// Nemotron-H keys were RoPE-rotated before its attention became NoPE; the
     /// marker gives it a fresh root. Null keeps every other arch's root.
     pub fn cacheLayoutNamespace(self: *const ModelConfig) ?[]const u8 {
+        if (self.ngram_cache_namespace_len != 0) return self.ngram_cache_namespace[0..self.ngram_cache_namespace_len];
         if (std.mem.eql(u8, self.model_type, "nemotron_h")) return "nemotron-h-nope-v1";
         if (self.rope_llama3 != null) return "llama3-rope-v1";
         // A pool's completing indexer row stores the pool's key in its gate half.
@@ -1106,6 +1111,10 @@ pub const ModelConfig = struct {
     /// in hyper-connection residual streams, with the n-gram PLE and QSA.
     pub fn isQwen4(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "qwen4_exp");
+    }
+
+    pub fn usesEmbeddedNgramTable(self: *const ModelConfig) bool {
+        return self.embedded_ple_payload_bytes != null and !self.ngram_table_external;
     }
 
     /// The long-context blast-radius predicate: every long-context mechanism (KV
@@ -1508,12 +1517,10 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     var config = try parseConfigFromJson(allocator, content);
     errdefer config.deinit(allocator);
     if (config.isQwen4()) {
-        // `--ngram-table` wins over the pack-local default so an external PLE
-        // table (a different precision, or a copy on another volume) can be
-        // measured without rewriting the pack. NOTE: a pack whose PLE table is
-        // EMBEDDED still wins at open time — transformer.zig opens the embedded
-        // source when `embedded_ple_payload_bytes` is set, and the override then
-        // only supplies the directory it is read from.
+        // An explicit external file wins even when this checkpoint embeds PLE.
+        // Keep embedded metadata: weight loading must still exclude its unused
+        // table tensors, infer checkpoint norms, and bill resident weights.
+        config.ngram_table_external = ngram_table_override != null;
         config.ngram_table_path = if (ngram_table_override) |override|
             try allocator.dupe(u8, override)
         else
@@ -1521,6 +1528,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         if (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(&config))) |info| {
             config.embedded_ple_payload_bytes = info.payload_bytes;
         }
+        setNgramTableCacheIdentity(io, &config);
     }
 
     // Model-author sampling recommendations ride in a sibling file. Optional —
@@ -8543,6 +8551,86 @@ test "unmarked embedded qwen4 defers norm convention until weights load" {
     defer accepted.deinit(testing.allocator);
     try testing.expectEqual(Qwen4NormConvention.delta, accepted.qwen4_norm_convention.?);
     try testing.expectEqual(@as(?u64, 120), accepted.embedded_ple_payload_bytes);
+}
+
+/// External table numerics are part of KV identity; disk-vs-mmap is not.
+fn setNgramTableCacheIdentity(io: std.Io, config: *ModelConfig) void {
+    config.ngram_cache_namespace_len = 0;
+    if (!config.isQwen4() or config.usesEmbeddedNgramTable()) return;
+    const path = config.ngram_table_path orelse return;
+    var hash = std.hash.XxHash64.init(0x706c_652d_6669_6c65);
+    hash.update(path);
+    if (std.Io.Dir.cwd().statFile(io, path, .{})) |st| {
+        hash.update(std.mem.asBytes(&st.size));
+        const mt: i128 = st.mtime.nanoseconds;
+        hash.update(std.mem.asBytes(&mt));
+    } else |_| hash.update("\x00missing\x00");
+    const ns = std.fmt.bufPrint(&config.ngram_cache_namespace, "qwen4-ple-file-v1-{x:0>16}", .{hash.final()}) catch unreachable;
+    config.ngram_cache_namespace_len = @intCast(ns.len);
+}
+
+test "ngram disk-only cache identity changes with table source but not IO mode" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    try td.dir.writeFile(io, .{ .sub_path = "a.bin", .data = "same-sized-data" });
+    try td.dir.writeFile(io, .{ .sub_path = "b.bin", .data = "same-sized-data" });
+    var root: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try td.dir.realPath(io, &root);
+    const a = try std.fmt.allocPrint(testing.allocator, "{s}/a.bin", .{root[0..len]});
+    defer testing.allocator.free(a);
+    const b = try std.fmt.allocPrint(testing.allocator, "{s}/b.bin", .{root[0..len]});
+    defer testing.allocator.free(b);
+    var config = ModelConfig{ .model_type = "qwen4_exp", .ngram_table_path = a, .embedded_ple_payload_bytes = 120 };
+    setNgramTableCacheIdentity(io, &config);
+    try testing.expect(config.cacheLayoutNamespace() == null);
+    config.ngram_table_external = true;
+    setNgramTableCacheIdentity(io, &config);
+    const first = config;
+    try testing.expect(first.cacheLayoutNamespace() != null);
+    setNgramTableCacheIdentity(io, &config);
+    try testing.expectEqualStrings(first.cacheLayoutNamespace().?, config.cacheLayoutNamespace().?);
+    const was = qwen4_exp.disk_only_enabled;
+    defer qwen4_exp.disk_only_enabled = was;
+    qwen4_exp.disk_only_enabled = true;
+    setNgramTableCacheIdentity(io, &config);
+    try testing.expectEqualStrings(first.cacheLayoutNamespace().?, config.cacheLayoutNamespace().?);
+    config.ngram_table_path = b;
+    setNgramTableCacheIdentity(io, &config);
+    try testing.expect(!std.mem.eql(u8, first.cacheLayoutNamespace().?, config.cacheLayoutNamespace().?));
+    config.ngram_table_path = a;
+    try td.dir.writeFile(io, .{ .sub_path = "a.bin", .data = "replaced-table-with-different-size" });
+    setNgramTableCacheIdentity(io, &config);
+    try testing.expect(!std.mem.eql(u8, first.cacheLayoutNamespace().?, config.cacheLayoutNamespace().?));
+}
+
+test "ngram disk-only external override wins without losing embedded pack metadata" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    try @import("qwen4_ple.zig").writeFixture(&td, .valid);
+    const json =
+        \\{"model_type":"qwen4_exp","hidden_size":64,"num_hidden_layers":2,
+        \\"num_attention_heads":1,"num_key_value_heads":1,"head_dim":64,
+        \\"vocab_size":1,"ple_layer_ids":[2],"ple_embed_dim":64,
+        \\"ngram_size":3,"heads_per_ngram":1,"ngram_vocab_size_base":2,
+        \\"make_ngram_vocab_size_divisible_by":6,"split_ngram_parts":3,
+        \\"indexer_n_heads":1,"indexer_head_dim":4,"indexer_budget":8,"indexer_compress_ratio":2}
+    ;
+    try td.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
+    var root: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try td.dir.realPath(io, &root);
+    defer setNgramTableOverride(null);
+    setNgramTableOverride("/another-volume/external.bin");
+    var external = try parseConfig(io, testing.allocator, root[0..len]);
+    defer external.deinit(testing.allocator);
+    try testing.expectEqualStrings("/another-volume/external.bin", external.ngram_table_path.?);
+    try testing.expectEqual(@as(?u64, 120), external.embedded_ple_payload_bytes);
+    try testing.expect(!external.usesEmbeddedNgramTable());
+    setNgramTableOverride(null);
+    var embedded = try parseConfig(io, testing.allocator, root[0..len]);
+    defer embedded.deinit(testing.allocator);
+    try testing.expect(embedded.usesEmbeddedNgramTable());
 }
 
 test "local oQ Qwen4 metadata defers convention until loaded weights" {

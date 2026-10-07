@@ -87,6 +87,7 @@ const ROW: usize = 4096;
 /// `table`'s mapping as one no-copy GPU buffer. On success MLX owns the munmap, and the
 /// table stops unmapping it on close.
 pub fn wrap(table: *qwen4.NgramTable) !Table {
+    if (table.disk_only) return error.NgramDiskOnlyGpuDisabled;
     const arr = try wrapMap(table.map);
     table.gpu_owns_map = true;
     return .{ .arr = arr, .w_off = table.w_off, .s_off = table.s_off, .b_off = table.b_off };
@@ -136,6 +137,10 @@ fn gb(bytes: u64) f64 {
 /// `model_bytes` the weights already resident. Null = the host gather. An embedded pack's
 /// shards are copied into one buffer, so the gate runs before anything is allocated.
 pub fn load(table: *qwen4.NgramTable, on: bool, model_bytes: u64) ?Table {
+    if (table.disk_only) {
+        log.info("[qwen4] ple gather: uncached host disk reads (GPU residency disabled)\n", .{});
+        return null;
+    }
     if (mlx.noGpuBackend()) {
         log.info("[qwen4] ple gather: cpu (no GPU backend)\n", .{});
         return null;
@@ -310,7 +315,7 @@ fn cpuRows(h: *const qwen4.NgramHash, t: *const qwen4.NgramTable, prev: []const 
     h.rowIds(prev, ids, rows);
     const host = try a.alloc(f32, rows.len * t.dim);
     defer a.free(host);
-    t.gather(rows, host, 0);
+    try t.gather(rows, host, 0);
     const out = try a.alloc(u16, host.len);
     for (host, out) |v, *o| o.* = qwen4.bf16Rne(v);
     return out;

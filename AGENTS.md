@@ -275,7 +275,8 @@ Sampling + logprobs + streams:
 - **A client cannot time our stream**: final-chunk server `timings`; the `include_usage` chunk ships `"choices": []`. Guard: `tests/test_loop_stop_signal.sh`.
 - **Liveness is a property of the SOCKET** (`beatStreamKeepalive`, 5 s byte-silence; `StreamHeartbeat` mirrors `StallClock`). GAP: Ollama sink drops SSE comments. `--timeout` is a STALL timeout; `toolCallFinishReason` preserves "length".
 - **A long job's abort must not depend on the RESPONSE SHAPE** (`gen_sse.StreamCtx.stream`, `Conn.peerClosed`).
-- **`Conn.close` sends FIN, then waits for the PEER to hang up (≤ 5 min) when the body is close-delimited** (SSE, NDJSON: no `Content-Length`): closed under a lagging reader, the kernel's `fin_timeout` RSTs it and the client gets ECONNRESET after every byte. A response written with a `Content-Length` sets `Conn.length_framed` and closes at once; an unmarked head keeps the wait. Guard: `tests/test_responses_streaming.sh` [G].
+- **Shared HTTP SSE uses chunked framing; Ollama NDJSON and WebSocket frames do not.** `Conn.close` emits one final chunk, then retains the existing FIN + peer-wait (≤ 5 min) for EOF-reading clients; only `Content-Length` sets `length_framed`. Guard: chunked wire tests + `tests/test_responses_streaming.sh` [G].
+- **`WARM=0` is not disk-only PLE.** `--ngram-disk-only` uses bounded uncached external-file reads (macOS), never mmap/warm/GPU fallback; read failures propagate. External source identity belongs in SSD KV keys, independently of embedded-checkpoint metadata.
 - **Grammar**: every state has a legal byte; the mask never walks the vocabulary (#380, `token_mask.buildMask`, `nextConstrained` lazy); NO whitespace OUTSIDE the root, the model's own layout inside (`MAX_FREE_WS` 16); token→bytes tables are per-MODEL (`grammarTokenBytes`). Guard: `tests/test_json_mode_multi_model.sh`.
 
 Loading + residency:

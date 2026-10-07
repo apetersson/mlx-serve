@@ -33,6 +33,7 @@ const sleep_inhibit_mod = @import("sleep_inhibit.zig");
 const version_mod = @import("version.zig");
 const ane_mod = @import("ane.zig");
 const ple_gpu = @import("ple_gpu.zig");
+const qwen4_mod = @import("qwen4_exp.zig");
 
 pub const VERSION: []const u8 = build_options.version;
 
@@ -129,6 +130,8 @@ fn printUsage(io: std.Io) void {
         \\                      <model_dir>/ngram_table.bin (qwen4 models only).
         \\                      Accepts an mlx-serve ngram_table.bin (any bits,
         \\                      incl. 16 = unquantized bf16) at any path.
+        \\  --ngram-disk-only   External n-gram rows via uncached disk reads;
+        \\                      no table mmap, warming or PLE GPU (macOS only).
         \\  --config-overrides <json>   JSON object deep-merged into EVERY
         \\                      model's config.json this process loads or
         \\                      discovers (alias: --hf-overrides). Generic keys
@@ -690,6 +693,9 @@ pub fn main(init: std.process.Init) !void {
             }
             model_mod.setConfigOverrides(args[i]);
             log.info("[args] config-overrides: {s}\n", .{args[i]});
+        } else if (std.mem.eql(u8, args[i], "--ngram-disk-only")) {
+            qwen4_mod.disk_only_enabled = true;
+            log.info("[args] ngram disk-only: uncached host row reads, no warming or GPU residency\n", .{});
         } else if (std.mem.eql(u8, args[i], "--ngram-table") and i + 1 < args.len) {
             i += 1;
             model_mod.setNgramTableOverride(args[i]);
