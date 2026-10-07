@@ -1508,7 +1508,16 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     var config = try parseConfigFromJson(allocator, content);
     errdefer config.deinit(allocator);
     if (config.isQwen4()) {
-        config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
+        // `--ngram-table` wins over the pack-local default so an external PLE
+        // table (a different precision, or a copy on another volume) can be
+        // measured without rewriting the pack. NOTE: a pack whose PLE table is
+        // EMBEDDED still wins at open time — transformer.zig opens the embedded
+        // source when `embedded_ple_payload_bytes` is set, and the override then
+        // only supplies the directory it is read from.
+        config.ngram_table_path = if (ngram_table_override) |override|
+            try allocator.dupe(u8, override)
+        else
+            try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
         if (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(&config))) |info| {
             config.embedded_ple_payload_bytes = info.payload_bytes;
         }
@@ -1968,6 +1977,20 @@ fn yarnMscale(factor: f32) f32 {
 /// only way to re-shape a checkpoint's declared geometry — most often to scale
 /// its rope and widen the context — without editing the model directory, and
 /// therefore the way to A/B a scaling experiment on identical weights.
+/// `--ngram-table <path>`: use this PLE table instead of the pack-local
+/// `<model_dir>/ngram_table.bin`. Module global (like config overrides) so
+/// serve, run and the registry stubs all resolve the same file. The path
+/// itself is owned by argv, not by this module.
+var ngram_table_override: ?[]const u8 = null;
+
+pub fn setNgramTableOverride(raw: ?[]const u8) void {
+    ngram_table_override = raw;
+}
+
+pub fn getNgramTableOverride() ?[]const u8 {
+    return ngram_table_override;
+}
+
 var config_overrides: ?[]const u8 = null;
 
 pub fn setConfigOverrides(raw: ?[]const u8) void {

@@ -125,6 +125,10 @@ fn printUsage(io: std.Io) void {
         \\                      network; a future version will default to 127.0.0.1)
         \\  --port <n>          Bind port (default: 11234)
         \\  --ctx-size <n>      Maximum context length (default: model max)
+        \\  --ngram-table <path>  Use an external PLE n-gram table instead of
+        \\                      <model_dir>/ngram_table.bin (qwen4 models only).
+        \\                      Accepts an mlx-serve ngram_table.bin (any bits,
+        \\                      incl. 16 = unquantized bf16) at any path.
         \\  --config-overrides <json>   JSON object deep-merged into EVERY
         \\                      model's config.json this process loads or
         \\                      discovers (alias: --hf-overrides). Generic keys
@@ -686,6 +690,10 @@ pub fn main(init: std.process.Init) !void {
             }
             model_mod.setConfigOverrides(args[i]);
             log.info("[args] config-overrides: {s}\n", .{args[i]});
+        } else if (std.mem.eql(u8, args[i], "--ngram-table") and i + 1 < args.len) {
+            i += 1;
+            model_mod.setNgramTableOverride(args[i]);
+            log.info("[args] external ngram table: {s}\n", .{args[i]});
         } else if (std.mem.eql(u8, args[i], "--embedding-max-length") and i + 1 < args.len) {
             i += 1;
             // Module global (like --max-concurrent): every serve path reads it,

@@ -319,12 +319,22 @@ pub const NgramTable = struct {
         // Raw BF16 mode: one `weight` BF16 [rows, dim] region, no
         // scales/biases. `wcols`/`scols` stay 0; only `row`'s raw arm reads it.
         if (bits == 16) {
-            const w = try headerRegion(obj, "weight", "BF16", 2, map.len, data_off);
-            if (w.cols > std.math.maxInt(u32)) return error.NgramTableRegion;
+            // Older external tables pack two BF16 values per U32; upstream
+            // tables use a BF16 region. Both have the same raw row bytes.
+            const legacy_u32 = blk: {
+                const weight = obj.get("weight") orelse return error.NgramTableRegion;
+                if (weight != .object) return error.NgramTableRegion;
+                const dtype = weight.object.get("dtype") orelse return error.NgramTableRegion;
+                if (dtype != .string) return error.NgramTableRegion;
+                break :blk std.mem.eql(u8, dtype.string, "U32");
+            };
+            const w = try headerRegion(obj, "weight", if (legacy_u32) "U32" else "BF16", if (legacy_u32) 4 else 2, map.len, data_off);
+            const dim = w.cols * @as(u64, if (legacy_u32) 2 else 1);
+            if (dim == 0 or dim > std.math.maxInt(u32)) return error.NgramTableRegion;
             return .{
                 .map = map,
                 .rows = w.rows,
-                .dim = @intCast(w.cols),
+                .dim = @intCast(dim),
                 .bits = bits,
                 .group_size = gs,
                 .w_off = data_off + @as(usize, @intCast(w.start)),
@@ -600,7 +610,6 @@ pub const NgramTable = struct {
         if (self.embedded) |source| return source.preadPart(r, region, dst);
         return std.c.pread(self.fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
     }
-
 };
 
 /// Persistent gather workers. Every row's three regions are one SSD read on
@@ -1495,4 +1504,25 @@ test "WarmProgress emits on the byte step, on the silence timeout, and never twi
     try testing.expect(p.should(WARM_LOG_BYTES * 4, 14 * S));
     try testing.expect(!p.should(WARM_LOG_BYTES * 4 + 1, 15 * S));
     try testing.expect(p.should(WARM_LOG_BYTES * 5, 16 * S));
+}
+
+test "ngram table raw BF16: upstream and legacy U32 headers decode identical rows" {
+    const headers = [_][]const u8{
+        "{\"__metadata__\":{\"bits\":\"16\",\"group_size\":\"1\"},\"weight\":{\"dtype\":\"BF16\",\"shape\":[2,4],\"data_offsets\":[0,16]}}",
+        "{\"__metadata__\":{\"bits\":\"16\",\"group_size\":\"1\"},\"weight\":{\"dtype\":\"U32\",\"shape\":[2,2],\"data_offsets\":[0,16]}}",
+    };
+    for (headers) |header| {
+        const buf = try ngramTestImage(header, 16);
+        defer std.heap.page_allocator.free(buf);
+        const values = [_]u16{ 0x3f80, 0x4000, 0xbf80, 0x0000, 0x4040, 0x4080, 0x40a0, 0x40c0 };
+        for (values, 0..) |v, i| std.mem.writeInt(u16, buf[520 + i * 2 ..][0..2], v, .little);
+        const t = try NgramTable.parse(buf, buf[8..520], 520);
+        try testing.expectEqual(@as(u32, 4), t.dim);
+        try testing.expectEqual(@as(u64, 2), t.rows);
+        var out: [4]f32 = undefined;
+        t.row(0, &out);
+        try testing.expectEqualSlices(f32, &.{ 1, 2, -1, 0 }, &out);
+        t.row(1, &out);
+        try testing.expectEqualSlices(f32, &.{ 3, 4, 5, 6 }, &out);
+    }
 }
