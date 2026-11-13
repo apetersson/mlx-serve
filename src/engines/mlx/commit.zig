@@ -76,6 +76,23 @@ fn heldTokens(a: std.mem.Allocator, prompt: []const u32, forwarded: []const u32,
     return out;
 }
 
+const ModuleSpillAdmission = struct {
+    sch: *Scheduler,
+    config: ?*const @import("../../sdk/config/model.zig").ModelConfig,
+    max_bytes: u64,
+
+    fn admit(ctx: ?*anyopaque, bytes: u64) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        const staged = @import("cache/budget.zig").stagedHostBytes(self.sch);
+        if (staged > self.max_bytes or bytes > self.max_bytes - staged) return false;
+        return bytes <= @import("admission/prefill_chunk.zig").prefillHeadroomNow(self.config orelse return false, staged);
+    }
+
+    fn now(_: ?*anyopaque) i64 {
+        return @import("../../sdk/util/crt.zig").monotonicMs();
+    }
+};
+
 /// A module-owned slot's state where decode stopped, committed beside its prompt boundary so the next turn resumes
 /// after the generated tail. A plugin captures at a prompt's last token: the slot is handed its own tokens and one
 /// more as a prompt it already stands at the end of, and refuses when it stands elsewhere.
@@ -135,7 +152,19 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             return;
         }
         // The snapshot describes its own forwarded prompt boundary, excluding the generated tail.
-        _ = hc.commitModule(binding, snap, info.ids.slice(), info.prefix_key, slot.media, slot.has_tools, slot.cache.config, slot.cache_key) catch |err| {
+        var spill: ModuleSpillAdmission = .{
+            .sch = sch,
+            .config = slot.model.config,
+            .max_bytes = @min(@import("../../host/http/server.zig").launch().prefix_cache_mem_bytes, 2 << 30),
+        };
+        _ = hc.commitModuleWithSpill(binding, snap, info.ids.slice(), info.prefix_key, slot.media, slot.has_tools, slot.cache.config, slot.cache_key, .{
+            .ctx = &spill,
+            .admit = ModuleSpillAdmission.admit,
+            .now = ModuleSpillAdmission.now,
+            .deadline_ms = ModuleSpillAdmission.now(null) +| 1000,
+            .max_bytes = spill.max_bytes,
+            .stream = gen.xfm.s,
+        }) catch |err| {
             log.warn("[hot-cache] module commit failed: {s}\n", .{@errorName(err)});
             return;
         };

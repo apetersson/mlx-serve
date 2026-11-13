@@ -100,6 +100,16 @@ write it, and a commit cancels the unwritten export of what it extends or replac
 crash loses the cached state of a conversation that never paused: it prefills once. Guard: `a module tip is written
 once it has gone quiet`, `a turn's commit drops the unwritten export of the state it supersedes`.
 
+### RAM-declined module snapshots never reached the SSD tier
+Defect: repeated DeepSeek prompts reported zero cached tokens despite an enabled disk budget.
+Cause: a strict idle-RAM clamp rejected each whole module snapshot before the idle exporter could own it.
+Fix: the prompt commit may export directly while its caller still owns the snapshot, admitting bookkeeping
+and each bounded part against live request headroom and global staging. Writer backpressure, deadline or
+pressure cancels only this export; no GPU holder survives the call and metadata remains last.
+The deadline is cooperative, and this fallback trades additional completion latency and SSD writes for reuse.
+Guard: the `module decline spill` behavioral tests cover publication, dedup, pressure, busy/failure paths
+and disk reopen; the process-restart probe requires matching positive cached tokens and `source=disk`.
+
 ### A warm turn that could not share its prefix was refused (PR #518)
 Defect: a 46k-of-47.7k-warm agent turn on a 64 GB Mac got `PrefillDoesNotFit`. Cause: off SSD-first a restore shares
 buffers and the first append copies the whole prefix; the bill was honest. Fix: a full-entry hit that cannot share

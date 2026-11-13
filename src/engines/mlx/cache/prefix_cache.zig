@@ -2025,6 +2025,31 @@ pub const HotPrefixCache = struct {
         return self.commitModuleTail(binding, snapshot, ids, prefix_key, media, has_tools, quant_config, cache_key, 0);
     }
 
+    pub const ModuleSpillPolicy = struct {
+        ctx: ?*anyopaque,
+        admit: *const fn (?*anyopaque, u64) bool,
+        now: *const fn (?*anyopaque) i64,
+        deadline_ms: i64,
+        max_bytes: u64,
+        stream: mlx.mlx_stream,
+        stage_limit: u64 = 64 << 20,
+    };
+
+    pub fn commitModuleWithSpill(
+        self: *HotPrefixCache,
+        binding: ModuleBinding,
+        snapshot: plugin_abi.Handle,
+        ids: []const u32,
+        prefix_key: u64,
+        media: []const MediaSpan,
+        has_tools: bool,
+        quant_config: kv_quant.KVQuantConfig,
+        cache_key: u64,
+        policy: ModuleSpillPolicy,
+    ) !CommitStatus {
+        return self.commitModuleTailWithSpill(binding, snapshot, ids, prefix_key, media, has_tools, quant_config, cache_key, 0, policy);
+    }
+
     /// `commitModule` of the state where a request's decode stopped, `tail_from` prompt tokens then what it
     /// generated (`ModulePayload.tail_from`); 0 is a prompt boundary.
     pub fn commitModuleTail(
@@ -2039,6 +2064,22 @@ pub const HotPrefixCache = struct {
         cache_key: u64,
         tail_from: usize,
     ) !CommitStatus {
+        return self.commitModuleTailWithSpill(binding, snapshot, ids, prefix_key, media, has_tools, quant_config, cache_key, tail_from, null);
+    }
+
+    fn commitModuleTailWithSpill(
+        self: *HotPrefixCache,
+        binding: ModuleBinding,
+        snapshot: plugin_abi.Handle,
+        ids: []const u32,
+        prefix_key: u64,
+        media: []const MediaSpan,
+        has_tools: bool,
+        quant_config: kv_quant.KVQuantConfig,
+        cache_key: u64,
+        tail_from: usize,
+        spill: ?ModuleSpillPolicy,
+    ) !CommitStatus {
         var retained = false;
         defer if (!retained) plugin_driver.auxFree(binding.xfm, snapshot);
         if (!self.ram_enabled or self.max_entries == 0) return .declined;
@@ -2049,6 +2090,7 @@ pub const HotPrefixCache = struct {
         if (info.n != ids.len or info.prefix_key != prefix_key or !std.mem.eql(u32, info.ids.slice(), ids)) return .declined;
         const aux_bytes = plugin_driver.auxBytes(binding.xfm, snapshot);
         if (self.max_kv_bytes > 0 and aux_bytes > self.max_kv_bytes) {
+            if (spill) |policy| if (self.spillDeclinedModule(binding, snapshot, ids, prefix_key, media, has_tools, quant_config, aux_bytes, policy)) return .{ .disk_only = ids.len };
             self.logModuleDecline(ids.len, aux_bytes, "larger than the budget, raise --prefix-cache-mem");
             return .declined;
         }
@@ -2068,6 +2110,7 @@ pub const HotPrefixCache = struct {
             break :blk self.makeModuleRoom(aux_bytes, cache_key, tail_from > 0);
         };
         if (!room) {
+            if (spill) |policy| if (self.spillDeclinedModule(binding, snapshot, ids, prefix_key, media, has_tools, quant_config, aux_bytes, policy)) return .{ .disk_only = ids.len };
             self.logModuleDecline(ids.len, aux_bytes, if (tail_from > 0) "a decode-end checkpoint takes no prompt boundary's room" else "no entry could be evicted for it");
             return .declined;
         }
@@ -2093,6 +2136,115 @@ pub const HotPrefixCache = struct {
     }
 
     /// A module snapshot is kept whole or not at all, so the next turn of its conversation prefills cold.
+    fn spillDeclinedModule(
+        self: *HotPrefixCache,
+        binding: ModuleBinding,
+        snapshot: plugin_abi.Handle,
+        ids: []const u32,
+        prefix_key: u64,
+        media: []const MediaSpan,
+        has_tools: bool,
+        quant_config: kv_quant.KVQuantConfig,
+        aux_bytes: u64,
+        policy: ModuleSpillPolicy,
+    ) bool {
+        const had_error = mlx.errorPending();
+        if (had_error) return false;
+        defer mlx.dropLatchedErrorUnless(had_error);
+        defer self.syncModuleLosses();
+        return self.spillModuleFiles(binding, snapshot, ids, prefix_key, media, has_tools, quant_config, aux_bytes, policy) catch |err| {
+            log.info("  [disk-cache] declined module spill skipped ({d} tokens): {s}\n", .{ ids.len, @errorName(err) });
+            return false;
+        };
+    }
+
+    fn spillModuleFiles(
+        self: *HotPrefixCache,
+        binding: ModuleBinding,
+        snapshot: plugin_abi.Handle,
+        ids: []const u32,
+        prefix_key: u64,
+        media: []const MediaSpan,
+        has_tools: bool,
+        quant_config: kv_quant.KVQuantConfig,
+        aux_bytes: u64,
+        policy: ModuleSpillPolicy,
+    ) !bool {
+        const d = if (self.disk) |*dd| dd else return false;
+        if (ids.len < kv_disk_cache.MIN_PERSIST_TOKENS or d.module_context == null) return false;
+        if (d.pending_module != null) return error.ModuleSpillBusy;
+        if (policy.now(policy.ctx) >= policy.deadline_ms) return error.ModuleSpillDeadline;
+        const covered = spansBelow(media, ids.len);
+        const key = variantKey(prefix_key, binding.variant);
+        d.pollModuleWrites();
+        for (d.entries.items) |e| {
+            if (e.kind != .module or e.poisoned or e.module.?.state != .committed) continue;
+            if (e.kv_len != ids.len or @as(u64, @bitCast(e.module.?.manifest.prefix_key)) != key or
+                e.has_tools != has_tools or !std.meta.eql(e.quant, quant_config) or
+                !std.mem.eql(u32, e.tokens, ids) or e.media.len != covered.len) continue;
+            var same_media = true;
+            for (e.media, covered) |a, b| if (!std.meta.eql(a, b)) {
+                same_media = false;
+                break;
+            };
+            if (same_media) return true;
+        }
+        // Reserve the exporter, inventory/maps, token copies and a conservative history copy before asking the codec.
+        const bookkeeping = @sizeOf(ModuleExport) + 1024 * 4096 + 4 * kv_disk_cache.module_record.MAX_ENVELOPE_BYTES;
+        const overhead = aux_bytes +| bookkeeping +| @as(u64, ids.len) *| 12 +| @as(u64, covered.len) *| (3 * @sizeOf(MediaSpan));
+        if (overhead > policy.max_bytes or !policy.admit(policy.ctx, overhead)) return error.ModuleSpillHeadroom;
+        const payload: ModulePayload = .{ .binding = binding, .snapshot = snapshot, .n = ids.len, .prefix_key = key, .aux_bytes = aux_bytes };
+        const exported = try ModuleExport.create(self.allocator, payload);
+        defer exported.destroy(self.allocator);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const inventory_ = try exported.inventory(arena.allocator());
+        var encoded: u64 = @as(u64, ids.len) *| 4 +| exported.out.header_len;
+        for (inventory_) |tensor| encoded +|= tensor.bytes;
+        if (encoded > policy.max_bytes) return error.ModuleSpillByteLimit;
+        if (policy.now(policy.ctx) >= policy.deadline_ms) return error.ModuleSpillDeadline;
+        const id = (try d.registerModule(.{
+            .tokens = ids,
+            .prefix_key = key,
+            .has_tools = has_tools,
+            .quant = quant_config,
+            .media = covered,
+            .header = exported.header[0..exported.out.header_len],
+            .tensors = inventory_,
+        })) orelse return false;
+        var submitted = false;
+        defer if (!submitted) d.cancelModule(id, .memory_pressure);
+        for (d.entries.items) |e| if (e.id == id and e.bytes > policy.max_bytes) return error.ModuleSpillByteLimit;
+        // No retry or parked GPU holder: backpressure cancels only this immutable identity.
+        for (0..1028) |_| {
+            if (policy.now(policy.ctx) >= policy.deadline_ms) return error.ModuleSpillDeadline;
+            const need = d.modulePartStagingBytes(id);
+            if (need > @min(policy.stage_limit, 64 << 20)) return error.ModuleSpillStageLimit;
+            const extra = overhead +| need;
+            if (extra > policy.max_bytes or !policy.admit(policy.ctx, extra)) return error.ModuleSpillHeadroom;
+            var result: kv_disk_cache.DiskTier.ModuleSlice = undefined;
+            if (d.modulePartIndex(id) != null) {
+                var part = try exported.takePart(d, id);
+                defer d.freeNamed(&part);
+                result = try d.stageModulePart(id, part.items, policy.stream);
+            } else {
+                result = try d.stageModulePart(id, &.{}, policy.stream);
+            }
+            if (result == .done) {
+                if (policy.now(policy.ctx) >= policy.deadline_ms) return error.ModuleSpillDeadline;
+                result = try d.submitModuleMeta(id);
+                if (result == .done) {
+                    submitted = true;
+                    self.disk_dirty = true;
+                    log.info("  [disk-cache] declined module spilled to SSD ({d} tokens, id={d}; host writes submitted)\n", .{ ids.len, id });
+                    return true;
+                }
+            }
+            if (result == .busy) return error.ModuleSpillBusy;
+        }
+        return error.ModuleSpillDeadline;
+    }
+
     fn logModuleDecline(self: *const HotPrefixCache, tokens: usize, bytes: u64, why: []const u8) void {
         log.info("  [hot-cache] skipped module snapshot ({d} tokens, {d:.2} MB; {d:.2} MB budget): {s}\n", .{
             tokens,
@@ -11204,6 +11356,7 @@ const ModuleFake = struct {
     exports: usize = 0,
     fail_export: bool = false,
     large_export: bool = false,
+    spill_oversized_export: bool = false,
     loaded: bool = true,
     fail_slice: bool = false,
     cuts: [4]Snap = undefined,
@@ -11308,7 +11461,7 @@ const ModuleFake = struct {
         defer _ = mlx.mlx_array_free(scalar);
         for (0..2) |i| {
             var arr = mlx.mlx_array_new();
-            const shape = [_]c_int{if (i == 0 and f.large_export) 4 * 1024 * 1024 + 1 else 4};
+            const shape = [_]c_int{if (i == 0 and f.spill_oversized_export) 8 * 1024 * 1024 else if (i == 0 and f.large_export) 4 * 1024 * 1024 + 1 else 4};
             _ = mlx.mlx_full(&arr, &shape, 1, scalar, .float32, cpu);
             out.tensors.?[i] = .{ .name = .of(out.names.?[i * 4 ..][0..4]), .array = .{ .ctx = arr.ctx } };
             out.tensor_len += 1;
@@ -11882,7 +12035,6 @@ test "HotPrefixCache module: loaded instance gate keeps pipeline and streamed pa
     cfg.dist_shard = null;
 }
 
-
 test "HotPrefixCache module: incoming workload pays for eviction before an older conversation" {
     var fake: ModuleFake = .{};
     var bound: plugin_driver.Bound = undefined;
@@ -11979,6 +12131,225 @@ test "HotPrefixCache module: failed restore clears only its own error latch" {
         try testing.expectEqual(preexisting, mlx.errorPending());
         try testing.expectEqual(@as(usize, 1), snap.frees);
         try testing.expectEqual(@as(usize, 0), cache.entryCount());
+    }
+}
+
+const ModuleSpillTest = struct {
+    room: u64 = std.math.maxInt(u64),
+    time: i64 = 0,
+    step: i64 = 0,
+    calls: usize = 0,
+    fn admit(ctx: ?*anyopaque, bytes: u64) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        return bytes <= self.room;
+    }
+    fn now(ctx: ?*anyopaque) i64 {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        defer self.time += self.step;
+        return self.time;
+    }
+    fn policy(self: *@This(), stream: mlx.mlx_stream) HotPrefixCache.ModuleSpillPolicy {
+        return .{ .ctx = self, .admit = admit, .now = now, .deadline_ms = 1000, .max_bytes = 2 << 30, .stream = stream };
+    }
+    fn put(self: *@This(), hc: *HotPrefixCache, binding: ModuleBinding, snap: *ModuleFake.Snap, stream: mlx.mlx_stream) !CommitStatus {
+        return hc.commitModuleWithSpill(binding, snap, snap.ids, snap.key, &.{}, false, kv_quant.KVQuantConfig.dense, 0, self.policy(stream));
+    }
+};
+
+test "module decline spill: a one-byte RAM budget lands an immutable disk record without an idle snapshot" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try ModuleDiskTest.init(&tmp, 2);
+    defer hc.deinit();
+    hc.max_kv_bytes = 1;
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const ids = ModuleDiskTest.ids(7);
+    var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+    var probe: ModuleSpillTest = .{};
+    try testing.expectEqual(CommitStatus{ .disk_only = 512 }, try probe.put(&hc, binding, &snap, cpu));
+    try testing.expectEqual(@as(usize, 1), snap.frees);
+    try testing.expectEqual(@as(u64, 0), hc.residentBytes());
+    try testing.expect(hc.pending_disk == null and hc.finishing_disk == null);
+    hc.disk.?.drainWriter();
+    hc.disk.?.pollModuleWrites();
+    try testing.expectEqual(@as(u32, 1), hc.moduleCommittedCount());
+    const hit = hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+    try testing.expectEqual(.disk, hit.source);
+    try testing.expectEqual(@as(usize, 512), hit.n);
+    const old_bytes = hc.disk.?.bytes_persisted;
+    const old_exports = fake.exports;
+    var again = ModuleDiskTest.snap(&fake, ids[0..512]);
+    try testing.expectEqual(CommitStatus{ .disk_only = 512 }, try probe.put(&hc, binding, &again, cpu));
+    try testing.expectEqual(old_bytes, hc.disk.?.bytes_persisted);
+    try testing.expectEqual(old_exports, fake.exports);
+    var reopened = try ModuleDiskTest.init(&tmp, 2);
+    defer reopened.deinit();
+    reopened.max_kv_bytes = 1;
+    const restart_hit = reopened.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+    try testing.expectEqual(.disk, restart_hit.source);
+    try testing.expectEqual(@as(usize, 512), restart_hit.n);
+    var arrays = try reopened.disk.?.loadModuleParts(restart_hit.disk_id);
+    defer reopened.disk.?.freeNamed(&arrays);
+    try testing.expectEqual(@as(usize, 2), arrays.items.len);
+}
+
+test "module decline spill: limits and disabled retention decline without parking a snapshot" {
+    for (0..9) |mode| {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var fake: ModuleFake = .{};
+        var bound: plugin_driver.Bound = undefined;
+        var xfm: transformer_mod.Transformer = undefined;
+        const binding = fake.bind(&bound, &xfm);
+        var hc = try ModuleDiskTest.init(&tmp, 2);
+        defer hc.deinit();
+        hc.max_kv_bytes = 1;
+        const cpu = mlx.weightLoadStream();
+        defer _ = mlx.mlx_stream_free(cpu);
+        const ids = ModuleDiskTest.ids(7);
+        var snap = ModuleDiskTest.snap(&fake, ids[0..if (mode == 7) 511 else 512]);
+        var probe: ModuleSpillTest = .{};
+        var policy = probe.policy(cpu);
+        switch (mode) {
+            0 => probe.room = 0,
+            1 => probe.time = 1000,
+            2 => probe.step = 400,
+            3 => policy.max_bytes = 1,
+            4 => policy.stage_limit = 1,
+            5 => hc.ram_enabled = false,
+            6 => hc.max_entries = 0,
+            8 => fake.spill_oversized_export = true,
+            else => {},
+        }
+        try testing.expectEqual(CommitStatus.declined, try hc.commitModuleWithSpill(binding, &snap, snap.ids, snap.key, &.{}, false, kv_quant.KVQuantConfig.dense, 0, policy));
+        try testing.expectEqual(@as(usize, 1), snap.frees);
+        try testing.expectEqual(@as(u64, 0), hc.residentBytes());
+        try testing.expect(hc.pending_disk == null and hc.finishing_disk == null and hc.disk.?.pending_module == null);
+        hc.disk.?.drainWriter();
+        hc.disk.?.pollModuleWrites();
+        try testing.expectEqual(@as(u32, 0), hc.moduleCommittedCount());
+        try testing.expect(hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense) == null);
+    }
+}
+
+test "module decline spill: Writer publication is metadata-last and backpressure never parks device state" {
+    for (0..6) |mode| {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var fake: ModuleFake = .{};
+        var bound: plugin_driver.Bound = undefined;
+        var xfm: transformer_mod.Transformer = undefined;
+        const binding = fake.bind(&bound, &xfm);
+        var hc = try ModuleDiskTest.init(&tmp, 2);
+        defer hc.deinit();
+        hc.max_kv_bytes = 1;
+        const cpu = mlx.weightLoadStream();
+        defer _ = mlx.mlx_stream_free(cpu);
+        const ids = ModuleDiskTest.ids(7);
+        var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+        var probe: ModuleSpillTest = .{};
+        const w = hc.disk.?.writer.?;
+        w.setPaused(true);
+        defer w.setPaused(false);
+        switch (mode) {
+            0 => w.permit_bytes = 1,
+            1 => w.injectFailure("m000.", .submit),
+            2 => w.injectFailure("m000.", .write),
+            3 => fake.fail_export = true,
+            4 => mlx.latchErrorForTest("module spill existing error"),
+            else => {},
+        }
+        defer mlx.dropLatchedErrorUnless(false);
+        const result = try probe.put(&hc, binding, &snap, cpu);
+        try testing.expectEqual(mode == 4, mlx.errorPending());
+        if (mode == 2 or mode == 5) {
+            try testing.expectEqual(CommitStatus{ .disk_only = 512 }, result);
+            try testing.expectEqual(@as(u32, 0), hc.moduleCommittedCount());
+            w.mutex.lockUncancelable(testing.io);
+            const meta_last = std.mem.endsWith(u8, w.queue.items[w.queue.items.len - 1].path, "meta.json");
+            w.mutex.unlock(testing.io);
+            try testing.expect(meta_last);
+        } else {
+            try testing.expectEqual(CommitStatus.declined, result);
+            try testing.expectEqual(@as(u64, 0), hc.stagedHostBytes());
+        }
+        try testing.expectEqual(@as(usize, 1), snap.frees);
+        try testing.expectEqual(@as(u64, 0), hc.residentBytes());
+        try testing.expect(hc.pending_disk == null and hc.finishing_disk == null and hc.disk.?.pending_module == null);
+        w.setPaused(false);
+        hc.disk.?.drainWriter();
+        hc.disk.?.pollModuleWrites();
+        try testing.expectEqual(@as(u32, if (mode == 5) 1 else 0), hc.moduleCommittedCount());
+    }
+}
+
+test "module decline spill: unrelated pending export remains owned and disabled legacy APIs do not spill" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try ModuleDiskTest.init(&tmp, 2);
+    defer hc.deinit();
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const first_ids = ModuleDiskTest.ids(7);
+    var first = ModuleDiskTest.snap(&fake, first_ids[0..512]);
+    _ = try first.put(&hc, binding, &.{});
+    const id = hc.entries.items[0].module.?.disk_id.?;
+    const w = hc.disk.?.writer.?;
+    w.setPaused(true);
+    defer w.setPaused(false);
+    w.permit_bytes = 1;
+    _ = hc.flushOwedSlice(cpu);
+    _ = hc.flushOwedSlice(cpu);
+    try testing.expect(hc.disk.?.pending_module != null);
+    const state = hc.disk.?.moduleState(id).?;
+    const old_host = hc.stagedHostBytes();
+    hc.max_kv_bytes = 1;
+    const ids = ModuleDiskTest.ids(1000);
+    var second = ModuleDiskTest.snap(&fake, ids[0..512]);
+    var probe: ModuleSpillTest = .{};
+    try testing.expectEqual(CommitStatus.declined, try probe.put(&hc, binding, &second, cpu));
+    try testing.expectEqual(id, hc.disk.?.pending_module.?.id);
+    try testing.expectEqual(state, hc.disk.?.moduleState(id).?);
+    try testing.expectEqual(old_host, hc.stagedHostBytes());
+    try testing.expectEqual(@as(usize, 0), first.frees);
+    var legacy = ModuleDiskTest.snap(&fake, ids[0..512]);
+    try testing.expectEqual(CommitStatus.declined, try legacy.put(&hc, binding, &.{}));
+    try testing.expectEqual(@as(usize, 1), legacy.frees);
+}
+
+test "module decline spill: disk-off and legacy RAM paths keep their existing policy" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const ids = ModuleDiskTest.ids(7);
+    var probe: ModuleSpillTest = .{};
+    for ([_]u64{ 1, 1000 }) |budget| {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 2, budget);
+        defer hc.deinit();
+        var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+        const result = try probe.put(&hc, binding, &snap, cpu);
+        if (budget == 1) {
+            try testing.expectEqual(CommitStatus.declined, result);
+            try testing.expectEqual(@as(usize, 1), snap.frees);
+        } else {
+            try testing.expectEqual(CommitStatus{ .ok = 512 }, result);
+            try testing.expectEqual(@as(u64, 40), hc.residentBytes());
+        }
+        try testing.expectEqual(@as(usize, 0), fake.exports);
+        try testing.expectEqual(@as(usize, 0), probe.calls);
     }
 }
 

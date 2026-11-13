@@ -705,8 +705,20 @@ a successful import, restore, and prompt setup reports `n` cached tokens.
 Missing, truncated, or incompatible module files reject the entire record and
 prefill cold; KV's contiguous-chunk salvage remains separate.
 
-The finish path can continue staged work but never starts materializing a module
-part. The idle loop admits that staging memory and exports one file per slice,
+A prompt-boundary module checkpoint declined by RAM retention can instead attempt
+a bounded SSD spill while the caller still owns it. Prefix retention and the module
+disk tier must remain enabled; decode-end tails and explicit RAM-disable behavior
+are unchanged. The scheduler admits export bookkeeping and each part against live
+request headroom and global staged bytes. The original configured RAM-cache cap
+(capped at 2 GiB) bounds the spill; each staging step is capped at 64 MiB. A one-second
+cooperative deadline is checked between operations, not inside MLX or filesystem
+calls. Busy writers, pressure or failures cancel only this identity; no GPU snapshot
+is parked beyond the call. Metadata is submitted last, and submission is not a hit
+until writes complete. This exceptional path bypasses the quiet delay and adds
+completion latency and SSD writes; a duplicate committed checkpoint is reused.
+
+Otherwise, the finish path can continue staged work but never starts materializing
+a module part. The idle loop admits that staging memory and exports one file per slice,
 oldest owed source first. Writer backpressure retains the encoded blob for a
 retry and parks on a timed scheduler wait that request arrivals can wake.
 Metadata submission releases the snapshot, but a disk hit waits for its own
