@@ -710,8 +710,13 @@ a bounded SSD spill while the caller still owns it. Prefix retention and the mod
 disk tier must remain enabled; decode-end tails and explicit RAM-disable behavior
 are unchanged. The scheduler admits export bookkeeping and each part against live
 request headroom and global staged bytes. The original configured RAM-cache cap
-(capped at 2 GiB) bounds the spill; each staging step is capped at 64 MiB. A one-second
-cooperative deadline is checked between operations, not inside MLX or filesystem
+(capped at 2 GiB) bounds the combined source-capacity, bookkeeping, global queued/inflight
+host bytes and next-part staging bill. Each staging step is capped at 64 MiB, or
+512 MiB for DeepSeek-V4.1 whole compressed-cache tensors; this is temporary staging,
+not an increase in retained RAM. At bf16 width 512, the ratio-1 tensor needs roughly
+three times 1024 bytes per cached token, so the larger ceiling still declines
+prefixes above roughly 174K tokens. It does not qualify the full context window.
+A one-second cooperative deadline is checked between operations, not inside MLX or filesystem
 calls. Busy writers, pressure or failures cancel only this identity; no GPU snapshot
 is parked beyond the call. Metadata is submitted last, and submission is not a hit
 until writes complete. This exceptional path bypasses the quiet delay and adds

@@ -2213,13 +2213,15 @@ pub const HotPrefixCache = struct {
             .tensors = inventory_,
         })) orelse return false;
         var submitted = false;
+        var peak_stage: u64 = 0;
         defer if (!submitted) d.cancelModule(id, .memory_pressure);
         for (d.entries.items) |e| if (e.id == id and e.bytes > policy.max_bytes) return error.ModuleSpillByteLimit;
         // No retry or parked GPU holder: backpressure cancels only this immutable identity.
         for (0..1028) |_| {
             if (policy.now(policy.ctx) >= policy.deadline_ms) return error.ModuleSpillDeadline;
             const need = d.modulePartStagingBytes(id);
-            if (need > @min(policy.stage_limit, 64 << 20)) return error.ModuleSpillStageLimit;
+            if (need > @min(policy.stage_limit, 512 << 20)) return error.ModuleSpillStageLimit;
+            peak_stage = @max(peak_stage, need);
             const extra = overhead +| need;
             if (extra > policy.max_bytes or !policy.admit(policy.ctx, extra)) return error.ModuleSpillHeadroom;
             var result: kv_disk_cache.DiskTier.ModuleSlice = undefined;
@@ -2236,7 +2238,7 @@ pub const HotPrefixCache = struct {
                 if (result == .done) {
                     submitted = true;
                     self.disk_dirty = true;
-                    log.info("  [disk-cache] declined module spilled to SSD ({d} tokens, id={d}; host writes submitted)\n", .{ ids.len, id });
+                    log.info("  [disk-cache] declined module spilled to SSD ({d} tokens, id={d}; host writes submitted; overhead_bytes={d} peak_stage_bytes={d})\n", .{ ids.len, id, overhead, peak_stage });
                     return true;
                 }
             }
@@ -11357,6 +11359,7 @@ const ModuleFake = struct {
     fail_export: bool = false,
     large_export: bool = false,
     spill_oversized_export: bool = false,
+    spill_tensor_elements: c_int = 0,
     loaded: bool = true,
     fail_slice: bool = false,
     cuts: [4]Snap = undefined,
@@ -11461,7 +11464,7 @@ const ModuleFake = struct {
         defer _ = mlx.mlx_array_free(scalar);
         for (0..2) |i| {
             var arr = mlx.mlx_array_new();
-            const shape = [_]c_int{if (i == 0 and f.spill_oversized_export) 8 * 1024 * 1024 else if (i == 0 and f.large_export) 4 * 1024 * 1024 + 1 else 4};
+            const shape = [_]c_int{if (i == 0 and f.spill_tensor_elements > 0) f.spill_tensor_elements else if (i == 0 and f.spill_oversized_export) 8 * 1024 * 1024 else if (i == 0 and f.large_export) 4 * 1024 * 1024 + 1 else 4};
             _ = mlx.mlx_full(&arr, &shape, 1, scalar, .float32, cpu);
             out.tensors.?[i] = .{ .name = .of(out.names.?[i * 4 ..][0..4]), .array = .{ .ctx = arr.ctx } };
             out.tensor_len += 1;
@@ -12197,6 +12200,49 @@ test "module decline spill: a one-byte RAM budget lands an immutable disk record
     var arrays = try reopened.disk.?.loadModuleParts(restart_hit.disk_id);
     defer reopened.disk.?.freeNamed(&arrays);
     try testing.expectEqual(@as(usize, 2), arrays.items.len);
+}
+
+test "module decline spill: large whole tensors honor the selected stage and combined limits" {
+    for (0..5) |mode| {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var fake: ModuleFake = .{ .spill_tensor_elements = if (mode == 2) 48 * 1024 * 1024 else 9 * 1024 * 1024 };
+        var bound: plugin_driver.Bound = undefined;
+        var xfm: transformer_mod.Transformer = undefined;
+        const binding = fake.bind(&bound, &xfm);
+        var hc = try ModuleDiskTest.init(&tmp, 2);
+        defer hc.deinit();
+        hc.max_kv_bytes = 1;
+        const cpu = mlx.weightLoadStream();
+        defer _ = mlx.mlx_stream_free(cpu);
+        const ids = ModuleDiskTest.ids(7);
+        var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+        var probe: ModuleSpillTest = .{};
+        var policy = probe.policy(cpu);
+        if (mode != 1) policy.stage_limit = if (mode == 2) std.math.maxInt(u64) else 512 << 20;
+        if (mode == 3) policy.max_bytes = 100 << 20;
+        if (mode == 4) probe.room = 100 << 20;
+        const result = try hc.commitModuleWithSpill(binding, &snap, snap.ids, snap.key, &.{}, false, kv_quant.KVQuantConfig.dense, 0, policy);
+        try testing.expectEqual(@as(usize, 1), snap.frees);
+        try testing.expectEqual(@as(u64, 0), hc.residentBytes());
+        try testing.expect(hc.pending_disk == null and hc.finishing_disk == null and hc.disk.?.pending_module == null);
+        hc.disk.?.drainWriter();
+        hc.disk.?.pollModuleWrites();
+        if (mode == 0) {
+            try testing.expectEqual(CommitStatus{ .disk_only = 512 }, result);
+            try testing.expectEqual(@as(u32, 1), hc.moduleCommittedCount());
+            var reopened = try ModuleDiskTest.init(&tmp, 2);
+            defer reopened.deinit();
+            const hit = reopened.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+            try testing.expectEqual(.disk, hit.source);
+            var arrays = try reopened.disk.?.loadModuleParts(hit.disk_id);
+            defer reopened.disk.?.freeNamed(&arrays);
+            try testing.expectEqual(@as(usize, 2), arrays.items.len);
+        } else {
+            try testing.expectEqual(CommitStatus.declined, result);
+            try testing.expectEqual(@as(u32, 0), hc.moduleCommittedCount());
+        }
+    }
 }
 
 test "module decline spill: limits and disabled retention decline without parking a snapshot" {

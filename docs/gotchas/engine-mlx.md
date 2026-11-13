@@ -106,6 +106,8 @@ Cause: a strict idle-RAM clamp rejected each whole module snapshot before the id
 Fix: the prompt commit may export directly while its caller still owns the snapshot, admitting bookkeeping
 and each bounded part against live request headroom and global staging. Writer backpressure, deadline or
 pressure cancels only this export; no GPU holder survives the call and metadata remains last.
+Whole tensors are not split by the part planner: a 36 MiB compressed cache needs about 108 MiB staging.
+DeepSeek-V4.1 permits up to 512 MiB per part, still inside the unchanged total/live-memory checks.
 The deadline is cooperative, and this fallback trades additional completion latency and SSD writes for reuse.
 Guard: the `module decline spill` behavioral tests cover publication, dedup, pressure, busy/failure paths
 and disk reopen; the process-restart probe requires matching positive cached tokens and `source=disk`.

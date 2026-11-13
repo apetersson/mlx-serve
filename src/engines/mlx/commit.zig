@@ -76,16 +76,27 @@ fn heldTokens(a: std.mem.Allocator, prompt: []const u32, forwarded: []const u32,
     return out;
 }
 
+fn moduleSpillStageLimit(config: ?*const @import("../../sdk/config/model.zig").ModelConfig) u64 {
+    // DSV41 compressed caches are whole tensors; their readback still shares the total spill budget.
+    return if (config != null and config.?.isDsv41()) 512 << 20 else 64 << 20;
+}
+
 const ModuleSpillAdmission = struct {
     sch: *Scheduler,
     config: ?*const @import("../../sdk/config/model.zig").ModelConfig,
     max_bytes: u64,
+    peak_bill_bytes: u64 = 0,
+    min_headroom_bytes: u64 = std.math.maxInt(u64),
 
     fn admit(ctx: ?*anyopaque, bytes: u64) bool {
         const self: *@This() = @ptrCast(@alignCast(ctx.?));
         const staged = @import("cache/budget.zig").stagedHostBytes(self.sch);
         if (staged > self.max_bytes or bytes > self.max_bytes - staged) return false;
-        return bytes <= @import("admission/prefill_chunk.zig").prefillHeadroomNow(self.config orelse return false, staged);
+        const headroom = @import("admission/prefill_chunk.zig").prefillHeadroomNow(self.config orelse return false, staged);
+        if (bytes > headroom) return false;
+        self.peak_bill_bytes = @max(self.peak_bill_bytes, bytes + staged);
+        self.min_headroom_bytes = @min(self.min_headroom_bytes, headroom);
+        return true;
     }
 
     fn now(_: ?*anyopaque) i64 {
@@ -157,17 +168,19 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             .config = slot.model.config,
             .max_bytes = @min(@import("../../host/http/server.zig").launch().prefix_cache_mem_bytes, 2 << 30),
         };
-        _ = hc.commitModuleWithSpill(binding, snap, info.ids.slice(), info.prefix_key, slot.media, slot.has_tools, slot.cache.config, slot.cache_key, .{
+        const status = hc.commitModuleWithSpill(binding, snap, info.ids.slice(), info.prefix_key, slot.media, slot.has_tools, slot.cache.config, slot.cache_key, .{
             .ctx = &spill,
             .admit = ModuleSpillAdmission.admit,
             .now = ModuleSpillAdmission.now,
             .deadline_ms = ModuleSpillAdmission.now(null) +| 1000,
             .max_bytes = spill.max_bytes,
             .stream = gen.xfm.s,
+            .stage_limit = moduleSpillStageLimit(slot.model.config),
         }) catch |err| {
             log.warn("[hot-cache] module commit failed: {s}\n", .{@errorName(err)});
             return;
         };
+        if (status == .disk_only) log.info("  [disk-cache] module spill admission peak_bill_bytes={d} min_headroom_bytes={d} cap_bytes={d}\n", .{ spill.peak_bill_bytes, spill.min_headroom_bytes, spill.max_bytes });
         commitModuleDecodeEnd(sch, slot, gen, binding, hc);
         publishHotCacheResidency(sch);
         return;
@@ -364,6 +377,48 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
 }
 
 // ── tests ──
+
+test "module spill stage limit: only DSV41 admits large whole tensors" {
+    const ModelConfig = @import("../../sdk/config/model.zig").ModelConfig;
+    try testing.expectEqual(@as(u64, 64 << 20), moduleSpillStageLimit(null));
+    for ([_][]const u8{ "deepseek_v41", "deepseek_v4", "qwen4_exp", "" }) |name| {
+        const config: ModelConfig = .{ .model_type = name };
+        try testing.expectEqual(@as(u64, if (std.mem.eql(u8, name, "deepseek_v41")) 512 << 20 else 64 << 20), moduleSpillStageLimit(&config));
+    }
+}
+
+test "module spill admission: another ready model writer counts against the original cap" {
+    const registry = @import("../../host/registry/registry.zig");
+    const disk = @import("cache/ssd/disk_tier.zig");
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+    const reg = try registry.ModelRegistry.init(testing.allocator, testing.io, null, 4, 0, null);
+    defer reg.deinit();
+    const other = try reg.registerStub("other", "/other", 1);
+    other.state = .ready;
+    other.prefix_cache = try testing.allocator.create(prefix_cache_mod.HotPrefixCache);
+    const hc = other.prefix_cache.?;
+    hc.* = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
+    hc.disk = try disk.DiskTier.init(testing.allocator, testing.io, base, other.id, 0, 512);
+    hc.disk.?.enableBackgroundWriter();
+    const writer = hc.disk.?.writer.?;
+    writer.setPaused(true);
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/staged", .{hc.disk.?.root});
+    const bytes = try testing.allocator.dupe(u8, "other writer");
+    try testing.expectEqual(.accepted, try writer.trySubmit(path, bytes));
+    var sch: Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = testing.io;
+    sch.hot_prefix_cache = null;
+    const config: @import("../../sdk/config/model.zig").ModelConfig = .{};
+    var admission: ModuleSpillAdmission = .{ .sch = &sch, .config = &config, .max_bytes = 2 << 30 };
+    try testing.expect(!ModuleSpillAdmission.admit(&admission, (2 << 30) - 11));
+    try testing.expectEqual(@as(u64, 0), admission.peak_bill_bytes);
+    admission.max_bytes = 11;
+    try testing.expect(!ModuleSpillAdmission.admit(&admission, 1));
+}
 
 test "DFlash cache payload is committed only when it spans the trunk prefix" {
     try testing.expect(dflashContextCoversPrefix(128, 128));
