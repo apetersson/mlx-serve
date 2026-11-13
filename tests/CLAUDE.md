@@ -112,6 +112,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_multiclient_stress.sh` agents + chats + TTS + image on one server · `test_soak_24h.sh` 4-way soak
 
 **Memory, loading, registry**
+- `test_os_reserve_units.sh` **H** CPU-only host→engine reserve propagation across separate objects
 - `test_memory_pressure_4way.sh` low guard ceiling · `test_oom_preflight.sh` **H** refusal exits cleanly
 - `test_kv_cache_growth_memory.sh` long decode does not ratchet · `test_evict_returns_memory.sh` make-room frees memory
 - `test_idle_evict.sh` --idle-evict-secs · `test_load_progress.sh` /v1/load-progress · `test_cold_load_launch_flags.sh` cold loads keep flags

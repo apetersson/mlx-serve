@@ -14,6 +14,13 @@ types, shapes, offsets, page alignment and file bounds satisfy the pinned native
 count through ds4 routes, the load gate and adapter estimates; llama routes retain the full bill.
 Guards: `GGUF accounting` tests in the reader, CPU route, preflight and ds4 adapter.
 
+### OS reserve overrides must cross compilation units
+
+The host accepted `--os-reserve-gib` while engine preflight kept the automatic reserve: a plain global was
+compiled separately in each unit. Keep the optional override in host-owned `Shared` storage and list it in
+`shared_all.zig`. `tests/test_os_reserve_units.sh` links a host test to a separately compiled engine reader,
+checking explicit reserves, zero, automatic defaults and load-room saturation without MLX or model loads.
+
 ## Sampling
 
 ### `top_p: 0` masked every token and sampled uniform garbage
